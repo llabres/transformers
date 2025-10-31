@@ -591,6 +591,11 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
         self.spatial_merge_size = config.spatial_merge_size
         self.patch_size = config.patch_size
         self.spatial_merge_unit = self.spatial_merge_size * self.spatial_merge_size
+        # window/full attention control (aligned with qwen2_5_vl)
+        self.use_window_attention = bool(getattr(config, "use_window_attention", True))
+        self.window_size = int(getattr(config, "window_size", 112))
+        # prefer fullatt_block_indexes; keep alias compatibility
+        self.fullatt_block_indexes = list(getattr(config, "fullatt_block_indexes", []))
 
         self.patch_embed = Qwen3VLMoeVisionPatchEmbed(
             config=config,
@@ -720,6 +725,50 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
         patch_pos_embeds = torch.cat(patch_pos_embeds_permute)
         return patch_pos_embeds
 
+    def get_window_index(self, grid_thw: torch.Tensor):
+        # Adapted from Qwen2.5-VL get_window_index helper
+        window_index: list = []
+        cu_window_seqlens: list = [0]
+        window_index_id = 0
+        vit_merger_window_size = self.window_size // self.spatial_merge_size // self.patch_size
+
+        for grid_t, grid_h, grid_w in grid_thw:
+            llm_grid_h, llm_grid_w = (
+                grid_h // self.spatial_merge_size,
+                grid_w // self.spatial_merge_size,
+            )
+            index = torch.arange(grid_t * llm_grid_h * llm_grid_w, device=grid_thw.device).reshape(
+                grid_t, llm_grid_h, llm_grid_w
+            )
+            pad_h = vit_merger_window_size - llm_grid_h % vit_merger_window_size
+            pad_w = vit_merger_window_size - llm_grid_w % vit_merger_window_size
+            num_windows_h = (llm_grid_h + pad_h) // vit_merger_window_size
+            num_windows_w = (llm_grid_w + pad_w) // vit_merger_window_size
+            index_padded = F.pad(index, (0, pad_w, 0, pad_h), "constant", -100)
+            index_padded = index_padded.reshape(
+                grid_t,
+                num_windows_h,
+                vit_merger_window_size,
+                num_windows_w,
+                vit_merger_window_size,
+            )
+            index_padded = index_padded.permute(0, 1, 3, 2, 4).reshape(
+                grid_t,
+                num_windows_h * num_windows_w,
+                vit_merger_window_size,
+                vit_merger_window_size,
+            )
+            seqlens = (index_padded != -100).sum([2, 3]).reshape(-1)
+            index_padded = index_padded.reshape(-1)
+            index_new = index_padded[index_padded != -100]
+            window_index.append(index_new + window_index_id)
+            cu_seqlens_tmp = seqlens.cumsum(0) * self.spatial_merge_unit + cu_window_seqlens[-1]
+            cu_window_seqlens.extend(cu_seqlens_tmp.tolist())
+            window_index_id += (grid_t * llm_grid_h * llm_grid_w).item()
+        window_index = torch.cat(window_index, dim=0)
+
+        return window_index, cu_window_seqlens
+
     def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, **kwargs) -> torch.Tensor:
         """
         Args:
@@ -739,17 +788,67 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
         seq_len, _ = hidden_states.size()
-        hidden_states = hidden_states.reshape(seq_len, -1)
+
+        if self.use_window_attention:
+            # Precompute window order and seqlens (mirror qwen2_5_vl)
+            window_index, cu_window_seqlens = self.get_window_index(grid_thw)
+            cu_window_seqlens = torch.tensor(
+                cu_window_seqlens,
+                device=hidden_states.device,
+                dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
+            )
+            cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
+            reverse_indices = torch.argsort(window_index)
+
+            # Reorder tokens once to window order
+            hs = hidden_states.reshape(seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
+            hidden_states = hs[window_index, :, :].reshape(seq_len, -1)
+            rp = rotary_pos_emb.reshape(seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
+            rotary_pos_emb = rp[window_index, :, :].reshape(seq_len, -1)
+
+            emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+            position_embeddings = (emb.cos(), emb.sin())
+
+            # Full attention seqlens per frame (unchanged)
+            cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
+                dim=0,
+                dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
+            )
+            cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+
+            deepstack_feature_lists = []
+            for layer_num, blk in enumerate(self.blocks):
+                # Select window/full attention by layer index
+                cu_seqlens_now = cu_seqlens if layer_num in self.fullatt_block_indexes else cu_window_seqlens
+
+                hidden_states = blk(
+                    hidden_states,
+                    cu_seqlens=cu_seqlens_now,
+                    position_embeddings=position_embeddings,
+                    **kwargs,
+                )
+
+                if layer_num in self.deepstack_visual_indexes:
+                    # Merge per-position features, then map back to original order
+                    deep_feat = self.deepstack_merger_list[self.deepstack_visual_indexes.index(layer_num)](
+                        hidden_states
+                    )
+                    deep_feat = deep_feat[reverse_indices, :]
+                    deepstack_feature_lists.append(deep_feat)
+
+            # Final merger in window order, then reverse to original order
+            hidden_states = self.merger(hidden_states)
+            hidden_states = hidden_states[reverse_indices, :]
+
+            return hidden_states, deepstack_feature_lists
+
+        # Fallback: full attention only (no window reordering)
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
 
         cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
             dim=0,
-            # Select dtype based on the following factors:
-            #  - FA2 requires that cu_seqlens_q must have dtype int32
-            #  - torch.onnx.export requires that cu_seqlens_q must have same dtype as grid_thw
-            # See https://github.com/huggingface/transformers/pull/34852 for more information
             dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
         )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
@@ -769,7 +868,6 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
                 deepstack_feature_lists.append(deepstack_feature)
 
         hidden_states = self.merger(hidden_states)
-
         return hidden_states, deepstack_feature_lists
 
 

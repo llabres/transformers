@@ -204,6 +204,9 @@ class Qwen3VLMoeVisionConfig(PreTrainedConfig):
         num_position_embeddings=2304,
         deepstack_visual_indexes=[8, 16, 24],
         initializer_range=0.02,
+        use_window_attention=True,
+        window_size=112,
+        fullatt_block_indexes=[8, 16, 24],
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -221,6 +224,9 @@ class Qwen3VLMoeVisionConfig(PreTrainedConfig):
         self.num_position_embeddings = num_position_embeddings
         self.initializer_range = initializer_range
         self.deepstack_visual_indexes = deepstack_visual_indexes
+        self.use_window_attention = use_window_attention
+        self.window_size = window_size
+        self.fullatt_block_indexes = fullatt_block_indexes
 
 
 class Qwen3VLMoeConfig(PreTrainedConfig):
