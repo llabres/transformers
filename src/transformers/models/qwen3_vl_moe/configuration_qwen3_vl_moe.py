@@ -204,7 +204,7 @@ class Qwen3VLMoeVisionConfig(PreTrainedConfig):
         num_position_embeddings=2304,
         deepstack_visual_indexes=[8, 16, 24],
         initializer_range=0.02,
-        use_window_attention=True,
+        use_window_attention=False,
         window_size=112,
         fullatt_block_indexes=[8, 16, 24],
         **kwargs,
