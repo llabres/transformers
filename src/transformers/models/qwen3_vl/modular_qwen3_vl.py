@@ -15,7 +15,7 @@
 """PyTorch Qwen3-VL model."""
 
 from collections.abc import Callable
-from typing import List, Optional, Tuple, Union
+from typing import Optional, Union
 
 import numpy as np
 import torch
@@ -641,7 +641,7 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         return patch_pos_embeds
 
     def get_window_index(self, grid_thw: torch.Tensor):
-        # Copied from transformers.models.qwen2_5_vl.modular_qwen2_5_vl.Qwen2_5_VisionTransformerPretrainedModel.get_window_index with minimal adaptation
+        # Adapted from Qwen2.5-VL get_window_index helper
         window_index: list = []
         cu_window_seqlens: list = [0]
         window_index_id = 0
